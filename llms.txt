@@ -1,0 +1,24 @@
+# Fubuki (`fubuki` v0.2.0)
+
+> Pure-Rust 2024 (`#![forbid(unsafe_code)]`) cipherless keyed-BLAKE3 packet winnowing & Elligator2 headerless coercion-resistant dual volumes with `Mahajani`-style pubkey handshake authentication.
+
+## Core Modules
+- `src/kdf.rs`: `AuthModality` (`Passphrase`, `PubkeyHandshake`, `HybridPassphraseHandshake`), `Argon2id` (`64 MiB, t=3, p=4`) + domain-separated keyed `BLAKE3` (`k_enc`, `k_hdr`, `k_loc`), and `ZeroizeOnDrop` `SlotKeys`.
+- `src/pubkey.rs`: RFC 4880 CRC24 `.asc` keygen (`authorized_keys/<user>.asc`), `Mahajani` public-key discovery, `fubuki-chal-v1` / `fubuki-hs-v1` handshake computation, and 3-modality prompt parsing.
+- `src/winnow/{mod,scatter,filter}.rs`: Mode A cipherless chaffing/winnowing with 16B `N_s` seed, 40B tuples `(blinded_seq[8], symbol[16], mac[16])`, PKCS#7 framing, `fubuki.wheat.eos.v1` sentinel, and `subtle::ConstantTimeEq`.
+- `src/volume/{mod,fe25519,elligator,slot}.rs`: Mode B `64 + B * 4096` headerless volumes, constant-time 5x51-bit `GF(2^255 - 19)`, two-branch Curve25519 `Elligator2` preambles, dual-passphrase and dual-pubkey rejection sampling, and branchless `XChaCha20-Poly1305` stride decryption.
+- `src/audit.rs`: Shannon entropy $H(X)$, Pearson $\chi^2$ goodness-of-fit $p$-value, lag-1 serial correlation, Elligator2 top-bit balance, and magic-header signature scan.
+- `src/tui/{mod,panes}.rs`: 3-pane `ratatui` v0.30 console displaying live `AuthModality` + Hundi Challenge with `CWE-150` sanitization and zero hidden-slot disclosure.
+
+## CLI Entrypoints
+- `fubuki keygen --user <NAME> [--out-dir authorized_keys] [--json]`
+- `fubuki challenge <TARGET> [--json]`
+- `fubuki handshake --challenge <TARGET_OR_CHAL> [--secret-env <VAR>] [--pass-env <VAR> | --hybrid-pass]`
+- `fubuki scatter --ratio <N> [--key-env <VAR> | --pubkey <SPEC>] [--in <PATH>] [--out <PATH>]`
+- `fubuki winnow [--key-env <VAR>] [--in <PATH>] [--out <PATH>]`
+- `fubuki init-volume --size <SPEC> --out <PATH> [--decoy-max <SPEC>] [--duress-pass-env <VAR> --sov-pass-env <VAR> | --duress-pubkey <SPEC> --sov-pubkey <SPEC> [--duress-in <PATH> --sov-in <PATH>]]`
+- `python tools/fetch_keyserver.py <QUERY> [-u <USER>] [-d authorized_keys] [-s https://keys.openpgp.org/pks/lookup]`
+- `fubuki seal <VOLUME> --in <PATH> [--pubkey <SPEC>] [--eph-key-env <VAR>] [--pass-env <VAR> | --hybrid-pass] [--decoy-mode]`
+- `fubuki unlock <VOLUME> [--out <PATH>] [--pass-env <VAR>]`
+- `fubuki audit-entropy <TARGET> [--json]`
+- `fubuki tui [--target <PATH>]`

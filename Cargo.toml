@@ -1,0 +1,70 @@
+[package]
+name = "fubuki"
+version = "0.2.0"
+edition = "2024"
+authors = ["tsiscoe <tsiscoe@users.noreply.github.com>"]
+description = "Fubuki: Cipherless Keyed-BLAKE3 Winnowing & Elligator2 Coercion-Resistant Dual Volumes (Pure Rust 2024)"
+license = "MIT"
+repository = "https://github.com/tsiscoe/Fubuki"
+readme = "README.md"
+keywords = ["cryptography", "winnowing", "elligator2", "plausible-deniability", "security"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
+
+[[bin]]
+name = "fubuki"
+path = "src/main.rs"
+
+[lib]
+name = "fubuki"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography (Pure-Rust BLAKE3, XChaCha20-Poly1305, X25519 + Custom Elligator2, Argon2id, Subtle, Zeroize)
+blake3 = "1.5"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+argon2 = { version = "0.5", features = ["std"] }
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+
+# TUI (Ratatui v0.30+ & Crossterm)
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+rpassword = "7.3"
+
+[dev-dependencies]
+proptest = "1.5"
+tempfile = "3.14"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+
+[profile.dev.package.x25519-dalek]
+opt-level = 3
