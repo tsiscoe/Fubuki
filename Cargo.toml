@@ -34,7 +34,7 @@ subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
 rand = "0.8"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 
 # TUI (Ratatui v0.30+ & Crossterm)
 ratatui = "0.30"
