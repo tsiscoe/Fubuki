@@ -479,7 +479,10 @@ fn mahajani_pubkey_handshake_and_hybrid_dual_volume_coercion_symmetry() {
     )
     .expect("unlock one-shot decoy");
     assert_eq!(ud.payload.as_slice(), b"one-shot-decoy");
-    assert_eq!(ud.flags, 0, "FUBUKI-HORDE-03: decoy slot must never persist self-indicting flag bits");
+    assert_eq!(
+        ud.flags, 0,
+        "FUBUKI-HORDE-03: decoy slot must never persist self-indicting flag bits"
+    );
 
     let cs = parse_credential_input(&format!("hybrid-pin-99+{}", oneshot_hs_s.as_str()))
         .expect("parse one-shot sov hybrid");
@@ -529,7 +532,10 @@ fn fubuki_horde01_to_horde08_adversarial_hardening_gates() {
     );
 
     let kp = generate_keypair();
-    let bad_crc_armor = kp.armored_asc.replacen("=", "=AAAA#", 1).replace("AAAA#", "AAAA");
+    let bad_crc_armor = kp
+        .armored_asc
+        .replacen("=", "=AAAA#", 1)
+        .replace("AAAA#", "AAAA");
     assert!(
         parse_public_key_spec(&bad_crc_armor, None).is_err(),
         "FUBUKI-HORDE-02: corrupted RFC 4880 CRC24 checksum must be rejected"
@@ -572,11 +578,13 @@ fn fubuki_horde01_to_horde08_adversarial_hardening_gates() {
 
     // 4. FUBUKI-HORDE-05: Unkeyed BLAKE3(N_s || slot) can no longer unblind Mode A sequence indices.
     let k_mac = [0x77u8; 32];
-    let scattered = scatter_stream(&vec![0xABu8; 64], &k_mac, 3).expect("scatter");
+    let scattered = scatter_stream(&[0xABu8; 64], &k_mac, 3).expect("scatter");
     let ns = &scattered[..STREAM_SEED_LEN];
     let mut unkeyed_small_hits = 0usize;
     for (slot_idx, chunk) in scattered[STREAM_SEED_LEN..]
-        .chunks_exact(TUPLE_WIRE_LEN)
+        .as_chunks::<TUPLE_WIRE_LEN>()
+        .0
+        .iter()
         .enumerate()
     {
         let mut blinded = [0u8; 8];
@@ -601,7 +609,13 @@ fn fubuki_horde01_to_horde08_adversarial_hardening_gates() {
     for idx in 0..32u32 {
         let mut single = init_volume_bytes(64).expect("init 64 blocks"); // decoy_ceiling = 16
         let pw = format!("standalone-decoy-probe-{idx}");
-        match seal_volume_bytes(&mut single, pw.as_bytes(), b"decoy", true, KdfProfile::fast()) {
+        match seal_volume_bytes(
+            &mut single,
+            pw.as_bytes(),
+            b"decoy",
+            true,
+            KdfProfile::fast(),
+        ) {
             Ok((anchor, cnt)) => assert!((anchor as usize + cnt as usize) <= 16),
             Err(FubukiError::PayloadExceedsCapacity { .. }) => rejected_high_anchors += 1,
             Err(other) => panic!("unexpected error: {other:?}"),

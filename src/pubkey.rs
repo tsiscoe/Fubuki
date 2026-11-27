@@ -90,8 +90,9 @@ pub fn encode_pgp_public_armor(pub_bytes: &[u8; 32]) -> String {
 }
 
 /// RFC 6637 / RFC 4880 OpenPGP Curve25519 ECDH OID (`1.3.6.1.4.1.3029.1.5.1`) prefixed with length `0x0A`.
-const OPENPGP_CURVE25519_ECDH_OID: &[u8; 11] =
-    &[0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
+const OPENPGP_CURVE25519_ECDH_OID: &[u8; 11] = &[
+    0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+];
 
 /// Extract a genuine 32-byte X25519 Montgomery `u`-coordinate from an RFC 4880 OpenPGP packet stream
 /// containing a Curve25519 ECDH Public-Subkey or Public-Key packet (`OID 1.3.6.1.4.1.3029.1.5.1`,

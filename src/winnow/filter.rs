@@ -7,8 +7,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     AONT_CANARY_FRAMES, FRAME_WIDTH, MAC_TAG_LEN, STREAM_SEED_LEN, TUPLE_WIRE_LEN,
-    aont_package_decode, blind_sequence_index_with_subkey, compute_wheat_mac,
-    derive_seq_blind_key,
+    aont_package_decode, blind_sequence_index_with_subkey, compute_wheat_mac, derive_seq_blind_key,
 };
 use crate::{FubukiError, FubukiResult};
 
@@ -127,8 +126,7 @@ pub fn winnow_stream(stream: &[u8], k_mac: &[u8; 32]) -> FubukiResult<Zeroizing<
         return Err(FubukiError::MissingEndOfStream);
     }
 
-    let mut ordered_frames =
-        Zeroizing::new(Vec::with_capacity(last_seq as usize + 1));
+    let mut ordered_frames = Zeroizing::new(Vec::with_capacity(last_seq as usize + 1));
     for seq in 0..=last_seq {
         if let Some(mut frame) = verified.remove(&seq) {
             ordered_frames.push(frame.symbol);
