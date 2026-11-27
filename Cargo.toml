@@ -33,7 +33,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 argon2 = { version = "0.5", features = ["std"] }
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
-rand = "0.8"
+rand = "0.10"
 hex = "0.4"
 base64 = "0.22"
 
