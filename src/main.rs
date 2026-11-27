@@ -177,7 +177,7 @@ fn main() -> Result<()> {
             let sec_raw =
                 resolve_credential_raw(secret_env.as_deref(), "Private Key (fubuki-sec-v1:...): ")?;
             let sk = parse_secret_key_spec(&sec_raw)?;
-            let hs_token = compute_handshake_token(&sk, &repr);
+            let hs_token = compute_handshake_token(&sk, &repr)?;
 
             let hybrid_pw = if let Some(var) = pass_env.as_deref() {
                 Some(resolve_credential_raw(Some(var), "")?)
@@ -208,7 +208,7 @@ fn main() -> Result<()> {
             let k_mac = if let Some(pk_spec) = pubkey {
                 let recip_pub = parse_public_key_spec(&pk_spec, Some(&authorized_keys))?;
                 let (sk_eph, repr) = elligator2_generate_ephemeral(&mut rand::rngs::OsRng);
-                let hs = compute_sender_handshake(&sk_eph, &recip_pub);
+                let hs = compute_sender_handshake(&sk_eph, &recip_pub)?;
                 let chal = format_challenge_token(&repr);
                 eprintln!("Out-of-Band Mode A Hundi Challenge: {chal}");
                 derive_mode_a_mac_key_from_handshake(None, &hs)
@@ -319,7 +319,19 @@ fn main() -> Result<()> {
                         )?;
                         (buf, None)
                     }
-                    (None, None) => (init_volume_bytes(total_blocks)?, None),
+                    (None, None) => {
+                        if decoy_blocks.is_some() {
+                            return Err(anyhow!(
+                                "--decoy-max requires dual-slot credentials (--duress-pass-env + --sov-pass-env or --duress-pubkey + --sov-pubkey) to rejection-sample S_0"
+                            ));
+                        }
+                        if duress_in.is_some() || sov_in.is_some() {
+                            return Err(anyhow!(
+                                "--duress-in / --sov-in require --duress-pubkey and --sov-pubkey"
+                            ));
+                        }
+                        (init_volume_bytes(total_blocks)?, None)
+                    }
                     _ => {
                         return Err(anyhow!(
                             "provide both --duress-pass-env and --sov-pass-env, or omit both"
@@ -377,6 +389,7 @@ fn main() -> Result<()> {
             pubkey,
             authorized_keys,
             eph_key_env,
+            rekey_preamble,
             hybrid_pass,
             decoy_mode,
             kdf_profile,
@@ -393,7 +406,14 @@ fn main() -> Result<()> {
                         let raw = resolve_credential_raw(Some(var), "")?;
                         Some(parse_secret_key_spec(&raw)?)
                     }
-                    None => None,
+                    None => {
+                        if !rekey_preamble {
+                            return Err(anyhow!(
+                                "seal --pubkey without --eph-key-env would overwrite container S_0[0..64] and invalidate existing slots; pass --eph-key-env <VAR> or --rekey-preamble to confirm single-slot rekeying"
+                            ));
+                        }
+                        None
+                    }
                 };
                 let hybrid_pw = if let Some(var) = pass_env.as_deref() {
                     Some(resolve_credential_raw(Some(var), "")?)

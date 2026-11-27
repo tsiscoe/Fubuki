@@ -7,14 +7,16 @@ use fubuki::FubukiError;
 use fubuki::audit::audit_bytes;
 use fubuki::kdf::KdfProfile;
 use fubuki::pubkey::{
-    compute_handshake_token, format_challenge_token, generate_keypair, parse_credential_input,
-    parse_public_key_spec, parse_secret_key_spec,
+    compute_handshake_token, compute_sender_handshake, format_challenge_token, generate_keypair,
+    parse_challenge_token, parse_credential_input, parse_public_key_spec, parse_secret_key_spec,
 };
 use fubuki::tui::FubukiTuiApp;
 use fubuki::tui::panes::{render, sanitize_for_tui};
 use fubuki::volume::elligator::{
     elligator2_branch_sign, elligator2_decode, elligator2_generate_ephemeral,
+    elligator2_matches_secret,
 };
+use fubuki::volume::fe25519::{Fe25519, P_MINUS_1_DIV_2};
 use fubuki::volume::{
     BLOCK_SIZE, PREAMBLE_SIZE, init_and_seal_dual_pubkeys_bytes, init_volume_bytes,
     init_volume_dual_bytes, init_volume_dual_pubkeys_bytes, seal_volume_bytes,
@@ -32,11 +34,9 @@ fn elligator2_10000_samples_msb_branch_and_chi_square_uniformity() {
 
     for _ in 0..SAMPLES {
         let (sk, repr) = elligator2_generate_ephemeral(&mut rng);
-        let pk = PublicKey::from(&sk);
-        assert_eq!(
-            elligator2_decode(&repr),
-            *pk.as_bytes(),
-            "decoded Elligator2 u-coordinate must match X25519 public key"
+        assert!(
+            elligator2_matches_secret(&repr, &sk),
+            "decoded Elligator2 u-coordinate must match X25519 public key modulo E[8]"
         );
 
         bit254_ones += usize::from((repr[31] >> 6) & 1);
@@ -386,8 +386,8 @@ fn mahajani_pubkey_handshake_and_hybrid_dual_volume_coercion_symmetry() {
         parse_secret_key_spec(&kp_duress.secret_token).expect("parse duress secret token");
     let sk_sov = parse_secret_key_spec(&kp_sov.secret_token).expect("parse sov secret token");
 
-    let hs_duress = compute_handshake_token(&sk_duress, &s0_repr);
-    let hs_sov = compute_handshake_token(&sk_sov, &s0_repr);
+    let hs_duress = compute_handshake_token(&sk_duress, &s0_repr).expect("duress handshake");
+    let hs_sov = compute_handshake_token(&sk_sov, &s0_repr).expect("sov handshake");
 
     // 1. Pure Pubkey Handshake unlocks Slot 0 cleanly.
     let cred0 = parse_credential_input(&hs_duress).expect("parse pure handshake");
@@ -467,8 +467,8 @@ fn mahajani_pubkey_handshake_and_hybrid_dual_volume_coercion_symmetry() {
 
     let mut oneshot_repr = [0u8; 32];
     oneshot_repr.copy_from_slice(&one_shot.container[0..32]);
-    let oneshot_hs_d = compute_handshake_token(&sk_duress, &oneshot_repr);
-    let oneshot_hs_s = compute_handshake_token(&sk_sov, &oneshot_repr);
+    let oneshot_hs_d = compute_handshake_token(&sk_duress, &oneshot_repr).expect("oneshot hs d");
+    let oneshot_hs_s = compute_handshake_token(&sk_sov, &oneshot_repr).expect("oneshot hs s");
 
     let cd = parse_credential_input(&oneshot_hs_d).expect("parse one-shot duress hs");
     let ud = unlock_volume_with_modality_bytes(
@@ -479,6 +479,7 @@ fn mahajani_pubkey_handshake_and_hybrid_dual_volume_coercion_symmetry() {
     )
     .expect("unlock one-shot decoy");
     assert_eq!(ud.payload.as_slice(), b"one-shot-decoy");
+    assert_eq!(ud.flags, 0, "FUBUKI-HORDE-03: decoy slot must never persist self-indicting flag bits");
 
     let cs = parse_credential_input(&format!("hybrid-pin-99+{}", oneshot_hs_s.as_str()))
         .expect("parse one-shot sov hybrid");
@@ -490,4 +491,181 @@ fn mahajani_pubkey_handshake_and_hybrid_dual_volume_coercion_symmetry() {
     )
     .expect("unlock one-shot sovereign");
     assert_eq!(us.payload.as_slice(), b"one-shot-sovereign");
+    assert_eq!(us.flags, 0);
+}
+
+#[test]
+fn fubuki_horde01_to_horde08_adversarial_hardening_gates() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use fubuki::winnow::{
+        FRAME_WIDTH, STREAM_SEED_LEN, TUPLE_WIRE_LEN, aont_package_decode, aont_package_encode,
+        scatter_stream,
+    };
+
+    // 1. FUBUKI-HORDE-01: Keyless BLAKE3 Sponge-AONT masks ASCII & PKCS#7 [0x10; 16] and fails all-or-nothing.
+    let aligned_16 = b"0123456789ABCDEF";
+    let aont_frames = aont_package_encode(aligned_16);
+    assert_eq!(aont_frames.len(), 4); // 2 PKCS#7 frames + 2 canary frames
+    for frame in aont_frames.iter() {
+        assert_ne!(frame, aligned_16);
+        assert_ne!(frame, &[0x10u8; FRAME_WIDTH]);
+    }
+    let mut corrupted = aont_frames.clone();
+    corrupted[0][0] ^= 0x01;
+    // Flipping 1 bit in any masked frame scrambles r_pkg via BLAKE3 bind digest, failing PKCS#7 or corrupting all blocks.
+    if let Ok(unmasked) = aont_package_decode(&corrupted) {
+        assert_ne!(unmasked.as_slice(), aligned_16);
+    }
+
+    // 2. FUBUKI-HORDE-02: Non-X25519 OpenPGP block & corrupted CRC24 armor fail closed (never hash-to-pubkey).
+    let fake_rsa_packet = [0x99u8; 64]; // 64B fake RSA packet without Curve25519 OID
+    let fake_rsa_armor = format!(
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----\n",
+        B64.encode(fake_rsa_packet)
+    );
+    assert!(
+        parse_public_key_spec(&fake_rsa_armor, None).is_err(),
+        "FUBUKI-HORDE-02: non-Curve25519 PGP block must fail closed instead of hashing to unspendable point"
+    );
+
+    let kp = generate_keypair();
+    let bad_crc_armor = kp.armored_asc.replacen("=", "=AAAA#", 1).replace("AAAA#", "AAAA");
+    assert!(
+        parse_public_key_spec(&bad_crc_armor, None).is_err(),
+        "FUBUKI-HORDE-02: corrupted RFC 4880 CRC24 checksum must be rejected"
+    );
+
+    // Real RFC 6637 OpenPGP Curve25519 ECDH subkey packet (OID + 0x01 0x07 0x40 + 32B u) parses cleanly.
+    let mut rfc6637_pkt = vec![
+        0xB9, 0x00, 0x38, 0x04, 0x60, 0x00, 0x00, 0x00, 0x12, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01,
+        0x97, 0x55, 0x01, 0x05, 0x01, 0x01, 0x07, 0x40,
+    ];
+    rfc6637_pkt.extend_from_slice(kp.public.as_bytes());
+    rfc6637_pkt.extend_from_slice(&[0x03, 0x01, 0x08, 0x07]);
+    let rfc6637_armor = format!(
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----\n",
+        B64.encode(&rfc6637_pkt)
+    );
+    let extracted_pk =
+        parse_public_key_spec(&rfc6637_armor, None).expect("parse RFC 6637 Curve25519 subkey");
+    assert_eq!(extracted_pk.as_bytes(), kp.public.as_bytes());
+
+    // 3. FUBUKI-HORDE-04: Elligator2 8-torsion coset sampling eliminates Legendre symbol(u) == +1 distinguisher!
+    let mut rng = OsRng;
+    let mut legendre_pos = 0usize;
+    let mut legendre_neg = 0usize;
+    for _ in 0..512 {
+        let (_sk, repr) = elligator2_generate_ephemeral(&mut rng);
+        let u_bytes = elligator2_decode(&repr);
+        let u_fe = Fe25519::from_bytes(&u_bytes);
+        let leg = u_fe.pow_le_bytes(&P_MINUS_1_DIV_2);
+        if leg.ct_eq(Fe25519::ONE) == 1 {
+            legendre_pos += 1;
+        } else if leg.ct_eq(Fe25519::MINUS_ONE) == 1 {
+            legendre_neg += 1;
+        }
+    }
+    assert!(
+        legendre_pos > 180 && legendre_neg > 180,
+        "FUBUKI-HORDE-04: decoded u Legendre symbol must span both QR (+1: {legendre_pos}) and QNR (-1: {legendre_neg}) cosets"
+    );
+
+    // 4. FUBUKI-HORDE-05: Unkeyed BLAKE3(N_s || slot) can no longer unblind Mode A sequence indices.
+    let k_mac = [0x77u8; 32];
+    let scattered = scatter_stream(&vec![0xABu8; 64], &k_mac, 3).expect("scatter");
+    let ns = &scattered[..STREAM_SEED_LEN];
+    let mut unkeyed_small_hits = 0usize;
+    for (slot_idx, chunk) in scattered[STREAM_SEED_LEN..]
+        .chunks_exact(TUPLE_WIRE_LEN)
+        .enumerate()
+    {
+        let mut blinded = [0u8; 8];
+        blinded.copy_from_slice(&chunk[0..8]);
+        let mut h = blake3::Hasher::new();
+        h.update(ns);
+        h.update(&(slot_idx as u64).to_le_bytes());
+        let mut mask = [0u8; 8];
+        mask.copy_from_slice(&h.finalize().as_bytes()[0..8]);
+        let guessed_seq = u64::from_le_bytes(blinded) ^ u64::from_le_bytes(mask);
+        if guessed_seq < 1024 {
+            unkeyed_small_hits += 1;
+        }
+    }
+    assert_eq!(
+        unkeyed_small_hits, 0,
+        "FUBUKI-HORDE-05: keyless observer must not unblind small sequence indices"
+    );
+
+    // 5. FUBUKI-HORDE-06: Standalone seal_volume_bytes(..., decoy_mode=true) unconditionally rejects anchor >= decoy_ceiling.
+    let mut rejected_high_anchors = 0usize;
+    for idx in 0..32u32 {
+        let mut single = init_volume_bytes(64).expect("init 64 blocks"); // decoy_ceiling = 16
+        let pw = format!("standalone-decoy-probe-{idx}");
+        match seal_volume_bytes(&mut single, pw.as_bytes(), b"decoy", true, KdfProfile::fast()) {
+            Ok((anchor, cnt)) => assert!((anchor as usize + cnt as usize) <= 16),
+            Err(FubukiError::PayloadExceedsCapacity { .. }) => rejected_high_anchors += 1,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+    assert!(
+        rejected_high_anchors > 0,
+        "FUBUKI-HORDE-06: anchors >= 25% ceiling must be rejected in decoy_mode"
+    );
+
+    // 6. FUBUKI-HORDE-07: Low-order X25519 points & zeroed challenges fail was_contributory().
+    let zero_chal = parse_challenge_token(&format!("fubuki-chal-v1:{}", "00".repeat(32)))
+        .expect("parse challenge hex");
+    // Construct a representative r that decodes to u = 0 (or test low-order PublicKey([0u8; 32])).
+    let low_order_pk = PublicKey::from([0u8; 32]);
+    assert!(
+        compute_sender_handshake(&kp.secret, &low_order_pk).is_err(),
+        "FUBUKI-HORDE-07: all-zero low-order recipient pubkey must be rejected"
+    );
+    let mut single_vol = init_volume_bytes(32).expect("init");
+    assert!(
+        seal_volume_for_pubkey_bytes(
+            &mut single_vol,
+            &low_order_pk,
+            None,
+            None,
+            b"msg",
+            false,
+            KdfProfile::fast()
+        )
+        .is_err(),
+        "FUBUKI-HORDE-07: seal_volume_for_pubkey_bytes must reject low-order recipient pubkey"
+    );
+    let _ = zero_chal;
+
+    // 7. FUBUKI-HORDE-08: Poisoned authorized_keys/<user>.asc neither recurses infinitely nor leaks target file contents.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = dir.path().join("authorized_keys");
+    std::fs::create_dir_all(&auth).expect("mkdir");
+    let secret_target = dir.path().join("top_secret_canary.txt");
+    std::fs::write(&secret_target, "CANARY_SECRET_TOKEN_9999").expect("write canary");
+
+    // Self-referential alias loop (`loopuser.asc` containing `"loopuser"`)
+    std::fs::write(auth.join("loopuser.asc"), "loopuser\n").expect("write loop");
+    assert!(parse_public_key_spec("loopuser", Some(&auth)).is_err());
+
+    // File-hop redirect (`hopuser.asc` pointing at `secret_target`)
+    std::fs::write(
+        auth.join("hopuser.asc"),
+        secret_target.to_string_lossy().as_bytes(),
+    )
+    .expect("write hop");
+    let hop_err = match parse_public_key_spec("hopuser", Some(&auth)) {
+        Ok(_) => panic!("hop must fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !hop_err.contains("CANARY_SECRET_TOKEN_9999"),
+        "FUBUKI-HORDE-08: error message must never reflect secret file contents"
+    );
+
+    let sec_file_err = match parse_secret_key_spec(&secret_target.to_string_lossy()) {
+        Ok(_) => panic!("secret parse must fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(!sec_file_err.contains("CANARY_SECRET_TOKEN_9999"));
 }

@@ -207,6 +207,10 @@ pub enum Commands {
         #[arg(long)]
         eph_key_env: Option<String>,
 
+        /// Explicitly authorize replacing the container's 64-byte `S_0` preamble with a fresh ephemeral keypair when `--eph-key-env` is omitted (invalidates any previously sealed slots).
+        #[arg(long, default_value_t = false)]
+        rekey_preamble: bool,
+
         /// Prompt interactively for an additional hybrid passphrase when `--pubkey` is active.
         #[arg(long, default_value_t = false)]
         hybrid_pass: bool,

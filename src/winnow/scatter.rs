@@ -6,8 +6,8 @@ use rand::seq::SliceRandom;
 use zeroize::Zeroize;
 
 use super::{
-    FRAME_WIDTH, MAC_TAG_LEN, STREAM_SEED_LEN, TUPLE_WIRE_LEN, blind_sequence_index,
-    compute_wheat_mac, pkcs7_chunk_frames,
+    FRAME_WIDTH, MAC_TAG_LEN, STREAM_SEED_LEN, TUPLE_WIRE_LEN, aont_package_encode,
+    blind_sequence_index_with_subkey, compute_wheat_mac, derive_seq_blind_key,
 };
 use crate::{FubukiError, FubukiResult};
 
@@ -45,7 +45,7 @@ pub fn scatter_stream_with_window(
     let mut ns = [0u8; STREAM_SEED_LEN];
     rng.fill_bytes(&mut ns);
 
-    let mut frames = pkcs7_chunk_frames(payload);
+    let mut frames = aont_package_encode(payload);
     let total_frames = frames.len();
     let tuples_per_frame = 1usize + usize::from(ratio);
     let total_tuples = total_frames
@@ -87,7 +87,7 @@ pub fn scatter_stream_with_window(
         candidates.extend(group);
     }
 
-    for frame in &mut frames {
+    for frame in frames.iter_mut() {
         frame.zeroize();
     }
 
@@ -108,13 +108,15 @@ pub fn scatter_stream_with_window(
     let mut out = Vec::with_capacity(STREAM_SEED_LEN + total_tuples * TUPLE_WIRE_LEN);
     out.extend_from_slice(&ns);
 
+    let mut k_seq = derive_seq_blind_key(k_mac);
     for (slot_idx, mut tuple) in candidates.into_iter().enumerate() {
-        let blinded = blind_sequence_index(&ns, slot_idx as u64, tuple.seq_idx);
+        let blinded = blind_sequence_index_with_subkey(&k_seq, &ns, slot_idx as u64, tuple.seq_idx);
         out.extend_from_slice(&blinded.to_le_bytes());
         out.extend_from_slice(&tuple.symbol);
         out.extend_from_slice(&tuple.mac);
         tuple.zeroize();
     }
+    k_seq.zeroize();
 
     Ok(out)
 }

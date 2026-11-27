@@ -6,8 +6,9 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{
-    FRAME_WIDTH, MAC_TAG_LEN, STREAM_SEED_LEN, TUPLE_WIRE_LEN, blind_sequence_index,
-    compute_wheat_mac, pkcs7_strip_last_frame,
+    AONT_CANARY_FRAMES, FRAME_WIDTH, MAC_TAG_LEN, STREAM_SEED_LEN, TUPLE_WIRE_LEN,
+    aont_package_decode, blind_sequence_index_with_subkey, compute_wheat_mac,
+    derive_seq_blind_key,
 };
 use crate::{FubukiError, FubukiResult};
 
@@ -40,12 +41,13 @@ pub fn winnow_stream(stream: &[u8], k_mac: &[u8; 32]) -> FubukiResult<Zeroizing<
     let mut seen_seqs: BTreeSet<u64> = BTreeSet::new();
     let mut eos_seq: Option<u64> = None;
 
+    let mut k_seq = derive_seq_blind_key(k_mac);
     let (chunks, _) = body.as_chunks::<TUPLE_WIRE_LEN>();
     for (slot_idx, chunk) in chunks.iter().enumerate() {
         let mut seq_bytes = [0u8; 8];
         seq_bytes.copy_from_slice(&chunk[0..8]);
         let blinded_seq = u64::from_le_bytes(seq_bytes);
-        let seq_idx = blind_sequence_index(&ns, slot_idx as u64, blinded_seq);
+        let seq_idx = blind_sequence_index_with_subkey(&k_seq, &ns, slot_idx as u64, blinded_seq);
         seen_seqs.insert(seq_idx);
 
         let mut symbol = [0u8; FRAME_WIDTH];
@@ -65,6 +67,7 @@ pub fn winnow_stream(stream: &[u8], k_mac: &[u8; 32]) -> FubukiResult<Zeroizing<
             if let Some(existing) = verified.get(&seq_idx) {
                 if existing.symbol.ct_eq(&symbol).unwrap_u8() != 1 || existing.is_eos != eos_flag {
                     symbol.zeroize();
+                    k_seq.zeroize();
                     return Err(FubukiError::DuplicateSequenceFrame(seq_idx));
                 }
             } else {
@@ -81,6 +84,7 @@ pub fn winnow_stream(stream: &[u8], k_mac: &[u8; 32]) -> FubukiResult<Zeroizing<
                     && prev_eos != seq_idx
                 {
                     symbol.zeroize();
+                    k_seq.zeroize();
                     return Err(FubukiError::DuplicateSequenceFrame(seq_idx));
                 }
                 eos_seq = Some(seq_idx);
@@ -88,16 +92,20 @@ pub fn winnow_stream(stream: &[u8], k_mac: &[u8; 32]) -> FubukiResult<Zeroizing<
         }
         symbol.zeroize();
     }
+    k_seq.zeroize();
 
     let Some(last_seq) = eos_seq else {
-        // Identify the lowest sequence index that appeared in the stream with zero valid MACs
-        // (covers both wrong MAC keys and single-bit tampering of the final EOS frame).
-        for &candidate_seq in &seen_seqs {
-            if !verified.contains_key(&candidate_seq) {
-                return Err(FubukiError::MissingSequenceFrame(candidate_seq));
-            }
+        // Under keyed sequence blinding (`FUBUKI-HORDE-05`), wrong `k_mac` yields pseudorandom
+        // `seen_seqs` across `u64`; surface deterministic `MissingSequenceFrame(0)` when frame 0
+        // was never authenticated, or the lowest missing contiguous frame `0..` before EOS.
+        let mut missing = 0u64;
+        while verified.contains_key(&missing) {
+            missing += 1;
         }
-        return Err(FubukiError::MissingEndOfStream);
+        if seen_seqs.is_empty() {
+            return Err(FubukiError::MissingEndOfStream);
+        }
+        return Err(FubukiError::MissingSequenceFrame(missing));
     };
 
     for expected_seq in 0..=last_seq {
@@ -115,18 +123,18 @@ pub fn winnow_stream(stream: &[u8], k_mac: &[u8; 32]) -> FubukiResult<Zeroizing<
         return Err(FubukiError::DuplicateSequenceFrame(extra));
     }
 
-    let mut out = Zeroizing::new(Vec::with_capacity((last_seq as usize + 1) * FRAME_WIDTH));
+    if (last_seq as usize + 1) <= AONT_CANARY_FRAMES {
+        return Err(FubukiError::MissingEndOfStream);
+    }
+
+    let mut ordered_frames =
+        Zeroizing::new(Vec::with_capacity(last_seq as usize + 1));
     for seq in 0..=last_seq {
         if let Some(mut frame) = verified.remove(&seq) {
-            if seq == last_seq {
-                let tail = pkcs7_strip_last_frame(&frame.symbol)?;
-                out.extend_from_slice(tail);
-            } else {
-                out.extend_from_slice(&frame.symbol);
-            }
+            ordered_frames.push(frame.symbol);
             frame.zeroize();
         }
     }
 
-    Ok(out)
+    aont_package_decode(&ordered_frames)
 }
