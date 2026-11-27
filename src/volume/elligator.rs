@@ -5,8 +5,11 @@
 //! $r_2 = \sqrt{-2u(u+A)}/(2(u+A))$ in $[0, (p-1)/2]$ and randomizing top padding bits
 //! $b_{254}, b_{255}$ yields uniform 32-byte representatives indistinguishable from $\{0,1\}^{256}$.
 
+use curve25519_dalek::constants::EIGHT_TORSION;
+use curve25519_dalek::edwards::EdwardsPoint;
 use rand::{CryptoRng, RngCore};
-use x25519_dalek::{PublicKey, StaticSecret};
+use subtle::ConstantTimeEq;
+use x25519_dalek::StaticSecret;
 use zeroize::Zeroize;
 
 use super::fe25519::{Fe25519, P_MINUS_1_DIV_2, ct_gt_le};
@@ -52,8 +55,26 @@ pub fn elligator2_branch_sign(repr: &[u8; 32]) -> i8 {
     }
 }
 
+/// Verify in constant time whether `repr` decodes to any of the 8 torsion-coset translates
+/// `EdwardsPoint::mul_base_clamped(sk.to_bytes()) + T_j` (`j in 0..8`).
+pub fn elligator2_matches_secret(repr: &[u8; 32], sk: &StaticSecret) -> bool {
+    let decoded_u = elligator2_decode(repr);
+    let mut seed = sk.to_bytes();
+    let base = EdwardsPoint::mul_base_clamped(seed);
+    seed.zeroize();
+
+    let mut matched = 0u8;
+    for torsion in &EIGHT_TORSION {
+        let candidate_u = (base + torsion).to_montgomery().to_bytes();
+        matched |= decoded_u.ct_eq(&candidate_u).unwrap_u8();
+    }
+    matched == 1
+}
+
 /// Sample an ephemeral X25519 keypair whose public key admits a uniform two-branch `Elligator2`
-/// representative `repr: [u8; 32]` with randomized bits `254..=255`.
+/// representative `repr: [u8; 32]` with randomized bits `254..=255` and uniform 8-torsion coset
+/// translation (`[8k]B + T_j`, `T_j in E[8]`), eliminating `[8]E` subgroup distinguishers while
+/// preserving exact X25519 shared secrets under clamped scalar multiplication (`[8 * sk_r]T_j = O`).
 pub fn elligator2_generate_ephemeral<R: RngCore + CryptoRng>(
     rng: &mut R,
 ) -> (StaticSecret, [u8; 32]) {
@@ -63,11 +84,17 @@ pub fn elligator2_generate_ephemeral<R: RngCore + CryptoRng>(
     loop {
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
+        let mut rand_bytes = [0u8; 2];
+        rng.fill_bytes(&mut rand_bytes);
+
+        let coset_idx = usize::from(rand_bytes[1] & 0b111);
+        let ed_point = EdwardsPoint::mul_base_clamped(seed) + EIGHT_TORSION[coset_idx];
+        let u_bytes = ed_point.to_montgomery().to_bytes();
+
         let sk = StaticSecret::from(seed);
         seed.zeroize();
 
-        let pk = PublicKey::from(&sk);
-        let u = Fe25519::from_bytes(pk.as_bytes());
+        let u = Fe25519::from_bytes(&u_bytes);
         let u_plus_a = u + a;
 
         if u.is_zero() || u_plus_a.is_zero() {
@@ -79,10 +106,8 @@ pub fn elligator2_generate_ephemeral<R: RngCore + CryptoRng>(
             continue;
         };
 
-        let mut rand_byte = [0u8; 1];
-        rng.fill_bytes(&mut rand_byte);
-        let branch_bit = rand_byte[0] & 1;
-        let top2 = (rand_byte[0] >> 1) & 0b11;
+        let branch_bit = rand_bytes[0] & 1;
+        let top2 = (rand_bytes[0] >> 1) & 0b11;
 
         let r1 = root_w * (Fe25519::TWO * u).inv();
         let r2 = root_w * (Fe25519::TWO * u_plus_a).inv();
@@ -95,7 +120,7 @@ pub fn elligator2_generate_ephemeral<R: RngCore + CryptoRng>(
         let mut repr = r_canon.to_bytes();
         repr[31] |= top2 << 6;
 
-        if elligator2_decode(&repr) == *pk.as_bytes() {
+        if elligator2_decode(&repr) == u_bytes {
             return (sk, repr);
         }
     }

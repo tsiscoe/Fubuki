@@ -735,6 +735,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "curve25519-dalek",
  "hex",
  "proptest",
  "rand 0.8.8",

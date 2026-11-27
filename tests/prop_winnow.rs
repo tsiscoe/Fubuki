@@ -52,7 +52,7 @@ proptest! {
         for (slot_idx, chunk) in chunks.iter().enumerate() {
             let mut seq_raw = [0u8; 8];
             seq_raw.copy_from_slice(&chunk[0..8]);
-            let seq_idx = blind_sequence_index(&ns, slot_idx as u64, u64::from_le_bytes(seq_raw));
+            let seq_idx = blind_sequence_index(&key, &ns, slot_idx as u64, u64::from_le_bytes(seq_raw));
             let mut sym = [0u8; FRAME_WIDTH];
             sym.copy_from_slice(&chunk[8..8 + FRAME_WIDTH]);
             let mut mac = [0u8; MAC_TAG_LEN];
@@ -103,7 +103,15 @@ fn mode_a_rejects_wrong_key_and_unaligned_streams_and_passes_entropy_audit() {
 
     let audit = audit_bytes(&stream);
     assert!(audit.detected_magic_signatures.is_empty());
-    assert!(audit.shannon_entropy_bits_per_byte > 7.95);
+    assert!(audit.shannon_entropy_bits_per_byte > 7.98);
+    assert!(
+        audit.is_indistinguishable_noise,
+        "Mode A AONT-wrapped ASCII stream must pass chi-square uniformity audit: {audit:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&stream).contains("TOP_SECRET"),
+        "Mode A scattered stream must never expose cleartext ASCII substrings"
+    );
 
     // High-entropy payloads (e.g., Meade exports / random keys) scattered with Mode A framing
     // must pass full Pearson chi-square uniformity with zero statistical framing bias.

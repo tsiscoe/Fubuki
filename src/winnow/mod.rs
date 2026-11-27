@@ -8,7 +8,10 @@ pub mod filter;
 pub mod scatter;
 
 use crate::{FubukiError, FubukiResult};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Byte width of the uniform stream session seed `N_s`.
 pub const STREAM_SEED_LEN: usize = 16;
@@ -52,16 +55,149 @@ pub fn compute_wheat_mac(
     tag
 }
 
-/// Self-inverse unkeyed blinding of monotonic sequence index `seq_idx` at physical wire slot
-/// `slot_idx`: `seq_idx ^ Trunc64(BLAKE3(N_s || LE64(slot_idx)))`.
-pub fn blind_sequence_index(ns: &[u8; STREAM_SEED_LEN], slot_idx: u64, seq_idx: u64) -> u64 {
-    let mut hasher = blake3::Hasher::new();
+/// Domain separation context for deriving the sequence-index blinding subkey from `k_mac`.
+pub const DOMAIN_SEQ_BLIND: &[u8] = b"fubuki.wheat.seq_blind.v1";
+
+/// Domain separation context for the keyless All-Or-Nothing Package Transform (AONT) XOF mask.
+const DOMAIN_AONT_MASK: &str = "fubuki.aont.mask.v1";
+
+/// Domain separation context for the keyless All-Or-Nothing Package Transform (AONT) canary digest.
+const DOMAIN_AONT_BIND: &str = "fubuki.aont.bind.v1";
+
+/// Number of 16-byte canary frames appended by the keyless BLAKE3 AONT (`32` bytes = `2` frames).
+pub const AONT_CANARY_FRAMES: usize = 2;
+
+/// Derive the 32-byte sequence-blinding subkey from `k_mac` so passive keyless observers cannot
+/// unblind `seq_idx` or infer chaff ratio / payload frame counts (`FUBUKI-HORDE-05`).
+pub fn derive_seq_blind_key(k_mac: &[u8; 32]) -> [u8; 32] {
+    *blake3::keyed_hash(k_mac, DOMAIN_SEQ_BLIND).as_bytes()
+}
+
+/// Self-inverse keyed blinding of monotonic sequence index `seq_idx` at physical wire slot
+/// `slot_idx`: `seq_idx ^ Trunc64(BLAKE3_{k_seq}(N_s || LE64(slot_idx)))`.
+pub fn blind_sequence_index(
+    k_mac: &[u8; 32],
+    ns: &[u8; STREAM_SEED_LEN],
+    slot_idx: u64,
+    seq_idx: u64,
+) -> u64 {
+    let mut k_seq = derive_seq_blind_key(k_mac);
+    let out = blind_sequence_index_with_subkey(&k_seq, ns, slot_idx, seq_idx);
+    k_seq.zeroize();
+    out
+}
+
+pub(crate) fn blind_sequence_index_with_subkey(
+    k_seq: &[u8; 32],
+    ns: &[u8; STREAM_SEED_LEN],
+    slot_idx: u64,
+    seq_idx: u64,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new_keyed(k_seq);
     hasher.update(ns);
     hasher.update(&slot_idx.to_le_bytes());
     let digest = hasher.finalize();
     let mut mask = [0u8; 8];
     mask.copy_from_slice(&digest.as_bytes()[0..8]);
     seq_idx ^ u64::from_le_bytes(mask)
+}
+
+/// Keyless BLAKE3 Sponge-AONT (All-Or-Nothing Package Transform) over PKCS#7-padded payload frames.
+///
+/// Preserves Rivest's "zero encryption keys" property while ensuring every individual 16-byte wheat
+/// frame is marginally uniform over `{0,1}^128` (`FUBUKI-HORDE-01` — zero cleartext ASCII or
+/// `[0x10; 16]` PKCS#7 padding blocks on the wire) and unreadable unless *every* authentic wheat
+/// frame is winnowed via `k_mac`.
+pub fn aont_package_encode(payload: &[u8]) -> Zeroizing<Vec<[u8; FRAME_WIDTH]>> {
+    let mut raw_frames = pkcs7_chunk_frames(payload);
+    let payload_bytes_len = raw_frames.len() * FRAME_WIDTH;
+
+    let mut r_pkg = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *r_pkg);
+
+    let mut masked_bytes = Zeroizing::new(vec![0u8; payload_bytes_len]);
+    let mut xof = blake3::Hasher::new_derive_key(DOMAIN_AONT_MASK)
+        .update(&*r_pkg)
+        .finalize_xof();
+    xof.fill(&mut masked_bytes);
+
+    for (chunk_idx, frame) in raw_frames.iter_mut().enumerate() {
+        let base = chunk_idx * FRAME_WIDTH;
+        for b in 0..FRAME_WIDTH {
+            masked_bytes[base + b] ^= frame[b];
+        }
+        frame.zeroize();
+    }
+
+    let bind_digest = blake3::Hasher::new_derive_key(DOMAIN_AONT_BIND)
+        .update(&masked_bytes)
+        .finalize();
+    let mut canary = Zeroizing::new([0u8; 32]);
+    for i in 0..32 {
+        canary[i] = r_pkg[i] ^ bind_digest.as_bytes()[i];
+    }
+
+    let mut out = Zeroizing::new(Vec::with_capacity(raw_frames.len() + AONT_CANARY_FRAMES));
+    let (chunks, _) = masked_bytes.as_chunks::<FRAME_WIDTH>();
+    for &c in chunks {
+        out.push(c);
+    }
+    let mut c0 = [0u8; FRAME_WIDTH];
+    let mut c1 = [0u8; FRAME_WIDTH];
+    c0.copy_from_slice(&canary[0..FRAME_WIDTH]);
+    c1.copy_from_slice(&canary[FRAME_WIDTH..32]);
+    out.push(c0);
+    out.push(c1);
+    c0.zeroize();
+    c1.zeroize();
+    out
+}
+
+/// Keyless inverse of `aont_package_encode`: recovers `r_pkg` from the 32-byte canary + full
+/// masked package digest, unmasks the PKCS#7 frames, and strips constant-time padding.
+pub fn aont_package_decode(frames: &[[u8; FRAME_WIDTH]]) -> FubukiResult<Zeroizing<Vec<u8>>> {
+    if frames.len() <= AONT_CANARY_FRAMES {
+        return Err(FubukiError::MissingEndOfStream);
+    }
+    let masked_frame_count = frames.len() - AONT_CANARY_FRAMES;
+    let masked_len = masked_frame_count * FRAME_WIDTH;
+
+    let mut masked_bytes = Zeroizing::new(Vec::with_capacity(masked_len));
+    for frame in &frames[..masked_frame_count] {
+        masked_bytes.extend_from_slice(frame);
+    }
+
+    let mut canary = Zeroizing::new([0u8; 32]);
+    canary[0..FRAME_WIDTH].copy_from_slice(&frames[masked_frame_count]);
+    canary[FRAME_WIDTH..32].copy_from_slice(&frames[masked_frame_count + 1]);
+
+    let bind_digest = blake3::Hasher::new_derive_key(DOMAIN_AONT_BIND)
+        .update(&masked_bytes)
+        .finalize();
+    let mut r_pkg = Zeroizing::new([0u8; 32]);
+    for i in 0..32 {
+        r_pkg[i] = canary[i] ^ bind_digest.as_bytes()[i];
+    }
+
+    let mut pad_stream = Zeroizing::new(vec![0u8; masked_len]);
+    let mut xof = blake3::Hasher::new_derive_key(DOMAIN_AONT_MASK)
+        .update(&*r_pkg)
+        .finalize_xof();
+    xof.fill(&mut pad_stream);
+
+    for i in 0..masked_len {
+        pad_stream[i] ^= masked_bytes[i];
+    }
+
+    let mut last_frame = Zeroizing::new([0u8; FRAME_WIDTH]);
+    last_frame.copy_from_slice(&pad_stream[masked_len - FRAME_WIDTH..masked_len]);
+    let stripped_tail = pkcs7_strip_last_frame(&last_frame)?;
+
+    let prefix_len = masked_len - FRAME_WIDTH;
+    let mut out = Zeroizing::new(Vec::with_capacity(prefix_len + stripped_tail.len()));
+    out.extend_from_slice(&pad_stream[..prefix_len]);
+    out.extend_from_slice(stripped_tail);
+    Ok(out)
 }
 
 /// Partition arbitrary-length plaintext into PKCS#7-padded 16-byte frames (`L >= 1` frames).

@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::elligator::{elligator2_decode, elligator2_generate_ephemeral};
+use super::elligator::{elligator2_generate_ephemeral, elligator2_matches_secret};
 use super::{
     ANCHOR_DATA_CAPACITY, BLOCK_NONCE_SIZE, BLOCK_PLAINTEXT_SIZE, BLOCK_SIZE, BLOCK_TAG_SIZE,
     DEFAULT_B_GUARD, PREAMBLE_SIZE, SLOT_HEADER_SIZE, SLOT_MAGIC, container_byte_len,
@@ -91,10 +91,10 @@ pub fn generate_ephemeral_preamble() -> (StaticSecret, [u8; PREAMBLE_SIZE]) {
     (sk, s0)
 }
 
-/// Sample a uniform 64-byte preamble `S_0 = Elligator2(R)[32] || Salt_256[32]`.
+/// Sample a uniform 64-byte preamble `S_0` directly from `OsRng` (`FUBUKI-HORDE-04`).
 pub fn generate_uniform_preamble() -> [u8; PREAMBLE_SIZE] {
-    let (sk, s0) = generate_ephemeral_preamble();
-    drop(sk);
+    let mut s0 = [0u8; PREAMBLE_SIZE];
+    OsRng.fill_bytes(&mut s0);
     s0
 }
 
@@ -191,6 +191,31 @@ pub fn init_volume_dual_pubkeys_bytes(
     sov_pass: Option<&[u8]>,
     profile: KdfProfile,
 ) -> FubukiResult<DualPubkeyVolume> {
+    init_volume_dual_pubkeys_with_spans(
+        total_blocks,
+        decoy_max_blocks,
+        duress_pub,
+        sov_pub,
+        duress_pass,
+        sov_pass,
+        None,
+        None,
+        profile,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn init_volume_dual_pubkeys_with_spans(
+    total_blocks: u64,
+    decoy_max_blocks: Option<u64>,
+    duress_pub: &PublicKey,
+    sov_pub: &PublicKey,
+    duress_pass: Option<&[u8]>,
+    sov_pass: Option<&[u8]>,
+    duress_min_blocks: Option<u64>,
+    sov_min_blocks: Option<u64>,
+    profile: KdfProfile,
+) -> FubukiResult<DualPubkeyVolume> {
     if total_blocks < 16 {
         return Err(FubukiError::ContainerGeometryError(
             "dual-slot coercion volume requires at least 16 blocks".into(),
@@ -201,25 +226,52 @@ pub fn init_volume_dual_pubkeys_bytes(
         .unwrap_or(total_blocks / 4)
         .clamp(b_guard + 1, total_blocks / 2);
 
+    let d_span = duress_min_blocks.unwrap_or(b_guard).max(1);
+    let s_span = sov_min_blocks.unwrap_or(b_guard).max(1);
+
     if decoy_ceiling <= b_guard || total_blocks - decoy_ceiling <= b_guard {
         return Err(FubukiError::ContainerGeometryError(
             "decoy partition leaves insufficient guard margin for dual slots".into(),
         ));
     }
+    if d_span > decoy_ceiling {
+        return Err(FubukiError::PayloadExceedsCapacity {
+            needed_blocks: d_span as usize,
+            max_blocks: decoy_ceiling as usize,
+        });
+    }
+    if s_span > total_blocks - decoy_ceiling {
+        return Err(FubukiError::PayloadExceedsCapacity {
+            needed_blocks: s_span as usize,
+            max_blocks: (total_blocks - decoy_ceiling) as usize,
+        });
+    }
 
     for _ in 0..MAX_DUAL_RESALT_ATTEMPTS {
         let (sk_eph, s0) = generate_ephemeral_preamble();
-        let hs_duress = Zeroizing::new(*sk_eph.diffie_hellman(duress_pub).as_bytes());
+        let dh_duress = sk_eph.diffie_hellman(duress_pub);
+        if !dh_duress.was_contributory() {
+            return Err(FubukiError::KeyResolutionError(
+                "non-contributory low-order X25519 duress public key".into(),
+            ));
+        }
+        let hs_duress = Zeroizing::new(*dh_duress.as_bytes());
         let k_duress = derive_slot_keys_flexible(duress_pass, &s0, profile, Some(&*hs_duress))?;
         let beta_duress = compute_anchor_block(&k_duress.k_loc, total_blocks)?;
-        if beta_duress + b_guard > decoy_ceiling {
+        if beta_duress + d_span > decoy_ceiling {
             continue;
         }
 
-        let hs_sov = Zeroizing::new(*sk_eph.diffie_hellman(sov_pub).as_bytes());
+        let dh_sov = sk_eph.diffie_hellman(sov_pub);
+        if !dh_sov.was_contributory() {
+            return Err(FubukiError::KeyResolutionError(
+                "non-contributory low-order X25519 sovereign public key".into(),
+            ));
+        }
+        let hs_sov = Zeroizing::new(*dh_sov.as_bytes());
         let k_sov = derive_slot_keys_flexible(sov_pass, &s0, profile, Some(&*hs_sov))?;
         let beta_sov = compute_anchor_block(&k_sov.k_loc, total_blocks)?;
-        if beta_sov < decoy_ceiling || beta_sov + b_guard > total_blocks {
+        if beta_sov < decoy_ceiling || beta_sov + s_span > total_blocks {
             continue;
         }
 
@@ -267,13 +319,17 @@ pub fn init_and_seal_dual_pubkeys_bytes(
     sov_payload: &[u8],
     profile: KdfProfile,
 ) -> FubukiResult<DualSealedVolume> {
-    let mut dual = init_volume_dual_pubkeys_bytes(
+    let d_needed = blocks_needed_for_payload(duress_payload.len()) as u64;
+    let s_needed = blocks_needed_for_payload(sov_payload.len()) as u64;
+    let mut dual = init_volume_dual_pubkeys_with_spans(
         total_blocks,
         decoy_max_blocks,
         duress_pub,
         sov_pub,
         duress_pass,
         sov_pass,
+        Some(d_needed),
+        Some(s_needed),
         profile,
     )?;
 
@@ -426,20 +482,30 @@ pub fn seal_volume_for_pubkey_bytes(
         Some(sk_eph) => {
             let mut repr = [0u8; 32];
             repr.copy_from_slice(&container[0..32]);
-            let decoded_u = elligator2_decode(&repr);
-            let eph_pk = PublicKey::from(sk_eph);
-            if decoded_u != *eph_pk.as_bytes() {
+            if !elligator2_matches_secret(&repr, sk_eph) {
                 return Err(FubukiError::KeyResolutionError(
                     "ephemeral sealing key does not match container S_0[0..32] Elligator2 preamble"
                         .into(),
                 ));
             }
-            Zeroizing::new(*sk_eph.diffie_hellman(recipient_pub).as_bytes())
+            let dh = sk_eph.diffie_hellman(recipient_pub);
+            if !dh.was_contributory() {
+                return Err(FubukiError::KeyResolutionError(
+                    "non-contributory low-order X25519 recipient public key".into(),
+                ));
+            }
+            Zeroizing::new(*dh.as_bytes())
         }
         None => {
             let (sk_eph, s0) = generate_ephemeral_preamble();
+            let dh = sk_eph.diffie_hellman(recipient_pub);
+            if !dh.was_contributory() {
+                return Err(FubukiError::KeyResolutionError(
+                    "non-contributory low-order X25519 recipient public key".into(),
+                ));
+            }
             container[0..PREAMBLE_SIZE].copy_from_slice(&s0);
-            Zeroizing::new(*sk_eph.diffie_hellman(recipient_pub).as_bytes())
+            Zeroizing::new(*dh.as_bytes())
         }
     };
 
@@ -478,13 +544,10 @@ pub fn seal_volume_with_modality_bytes(
         });
     }
 
-    if decoy_mode
-        && (anchor as usize) < decoy_ceiling
-        && (anchor as usize + needed_blocks) > decoy_ceiling
-    {
+    if decoy_mode && (anchor as usize + needed_blocks) > decoy_ceiling {
         return Err(FubukiError::PayloadExceedsCapacity {
             needed_blocks,
-            max_blocks: decoy_ceiling - anchor as usize,
+            max_blocks: decoy_ceiling.saturating_sub(anchor as usize),
         });
     }
 
@@ -499,7 +562,9 @@ pub fn seal_volume_with_modality_bytes(
     let block_count_u32 = u32::try_from(needed_blocks)
         .map_err(|_| FubukiError::ContainerGeometryError("block count exceeds u32".into()))?;
     let created_unix_secs = Utc::now().timestamp().max(0) as u64;
-    let flags = if decoy_mode { FLAG_DECOY_CEILING } else { 0 };
+    // Never persist decoy/duress indicator bits inside the authenticated descriptor (`FUBUKI-HORDE-03`),
+    // preserving strict coercion symmetry between Slot 0 and Slot 1 under forensic inspection.
+    let flags: u32 = 0;
 
     // Anchor block plaintext: 32B internal header + up to 4024B payload + CSPRNG slack padding.
     let mut pt0 = Zeroizing::new([0u8; BLOCK_PLAINTEXT_SIZE]);
